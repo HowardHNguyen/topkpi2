@@ -1,38 +1,34 @@
-import math
-from typing import Dict, List
+import os
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
-import streamlit as st
 from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 
+import streamlit as st
+
+
 # -----------------------------------------------------------------------------
-# Page & basic theming
+# Page config
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="TopKPI2 – Advanced Marketing Growth & Retention Intelligence",
-    page_icon="📈",
     layout="wide",
+    page_icon="📈",
 )
 
-# Hide Streamlit chrome (keep the sidebar)
-HIDE_STREAMLIT_STYLE = """
-<style>
-#MainMenu {visibility: hidden;}
-header[data-testid="stHeader"] {visibility: hidden;}
-footer {visibility: hidden;}
-button[kind="header"] {display: none;}
-a[data-testid="stBaseLink"] {display:none;}
-</style>
-"""
-st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
+# (Optional) You can re-add your CSS to hide Streamlit chrome here if you like.
+# st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
 
 # -----------------------------------------------------------------------------
 # Constants & schema
 # -----------------------------------------------------------------------------
-REQUIRED_COLS: List[str] = [
+MAIN_DEFAULT_CSV = "data.csv"
+
+MAIN_REQUIRED_COLS: List[str] = [
     "Coverage",
     "Customer",
     "Customer Lifetime Value",
@@ -57,220 +53,235 @@ REQUIRED_COLS: List[str] = [
     "Total Claim Amount",
     "Vehicle Class",
     "Vehicle Size",
-    # New expected fields:
+    # New required fields for TopKPI2:
     "Churn",
     "EngagementScore",
 ]
 
-# Default cost assumptions by channel – override via sidebar
-DEFAULT_CHANNEL_COST_MAP: Dict[str, float] = {
+RETAIL_REQUIRED_COLS: List[str] = [
+    "InvoiceNo",
+    "InvoiceDate",
+    "StockCode",
+    "Description",
+    "Quantity",
+    "UnitPrice",
+    "CustomerID",
+]
+
+
+CHANNEL_COST_DEFAULTS = {
     "Web": 40.0,
     "Call Center": 70.0,
     "Branch": 90.0,
     "Agent": 120.0,
 }
 
+
 # -----------------------------------------------------------------------------
-# Helpers
+# Utility loaders
 # -----------------------------------------------------------------------------
-def yes_no_flag(series: pd.Series) -> pd.Series:
-    """Convert Yes/No style strings to 1/0, robust to casing/whitespace."""
-    return (
-        series.astype(str)
-        .str.strip()
-        .str.lower()
-        .map({"yes": 1, "no": 0})
-        .fillna(0)
-        .astype(int)
+def load_main_marketing_data() -> Optional[pd.DataFrame]:
+    """Load the marketing data (data.csv schema)."""
+
+    up = st.sidebar.file_uploader(
+        "Upload CSV (same schema as your notebooks)",
+        type="csv",
+        key="main_csv",
     )
 
-
-def safe_yes_no(df: pd.DataFrame, col: str) -> pd.Series:
-    """
-    Safely create a 0/1 flag for Yes/No column.
-    If the column is missing, return all zeros (avoids KeyError).
-    """
-    if col in df.columns:
-        return yes_no_flag(df[col])
+    if up is not None:
+        df = pd.read_csv(up)
+        st.success("Uploaded CSV successfully.")
+    elif os.path.exists(MAIN_DEFAULT_CSV):
+        df = pd.read_csv(MAIN_DEFAULT_CSV)
+        st.info(
+            "Loaded data.csv from repo root. "
+            "Upload your own CSV to replace it."
+        )
     else:
-        return pd.Series(0, index=df.index, dtype=int)
+        st.info("Upload marketing data (data.csv) to begin.")
+        return None
+
+    # Drop unnamed index columns if present
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    return df
 
 
-def compute_global_kpis(df: pd.DataFrame, channel_cost_map: Dict[str, float]) -> Dict[str, float]:
+def check_main_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    missing = [c for c in MAIN_REQUIRED_COLS if c not in df.columns]
+    return len(missing) == 0, missing
+
+
+def load_online_retail(upload_key: str = "retail_csv") -> Optional[pd.DataFrame]:
     """
-    Compute high-level KPIs:
-    - conversion rate
-    - churn rate
-    - CPA
-    - CLV realized & average CLV
-    - ROI
+    Load the Online Retail dataset used for Product Recommendations & Segmentation.
+    We allow the user to upload once and reuse via session_state["retail_df"].
     """
+
+    # Already in session?
+    if "retail_df" in st.session_state:
+        return st.session_state["retail_df"]
+
+    up = st.file_uploader(
+        "Upload Online Retail CSV (InvoiceNo, InvoiceDate, StockCode, "
+        "Description, Quantity, UnitPrice, CustomerID)",
+        type="csv",
+        key=upload_key,
+    )
+
+    if up is None:
+        st.info(
+            "Upload the Online Retail dataset (e.g., online_retail or "
+            "online_retail_II) to use this section."
+        )
+        return None
+
+    # Try UTF-8 then fall back to ISO-8859-1 (common for this dataset)
+    for enc in ("utf-8", "ISO-8859-1"):
+        try:
+            df = pd.read_csv(up, encoding=enc)
+            break
+        except UnicodeDecodeError:
+            df = None
+
+    if df is None:
+        st.error("Could not decode CSV. Try re-saving as UTF-8 or ISO-8859-1.")
+        return None
+
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    st.session_state["retail_df"] = df
+    st.success("Online Retail data loaded and cached for this session.")
+    return df
+
+
+def check_retail_schema(df: pd.DataFrame) -> Tuple[bool, List[str]]:
+    missing = [c for c in RETAIL_REQUIRED_COLS if c not in df.columns]
+    return len(missing) == 0, missing
+
+
+# -----------------------------------------------------------------------------
+# KPI helpers (marketing dataset)
+# -----------------------------------------------------------------------------
+def prepare_main_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Add convenience flags and typed columns."""
+    df = df.copy()
+
+    # conversion flag from Response
+    df["conversion_flag"] = (
+        df["Response"].astype(str).str.strip().str.lower().eq("yes")
+    ).astype(int)
+
+    # engaged flag from Response (per your definition)
+    df["Engaged"] = df["conversion_flag"]
+
+    # ensure Churn is numeric 0/1
+    df["Churn"] = pd.to_numeric(df["Churn"], errors="coerce").fillna(0).astype(int)
+
+    # EngagementScore numeric
+    df["EngagementScore"] = pd.to_numeric(
+        df["EngagementScore"], errors="coerce"
+    ).fillna(0.0)
+
+    # Basic date parsing
+    df["Effective To Date"] = pd.to_datetime(
+        df["Effective To Date"], errors="coerce"
+    )
+
+    # Normalize CLV
+    df["Customer Lifetime Value"] = pd.to_numeric(
+        df["Customer Lifetime Value"], errors="coerce"
+    ).fillna(0.0)
+
+    return df
+
+
+def compute_global_kpis(
+    df: pd.DataFrame, channel_cost_map: Dict[str, float]
+) -> Dict[str, float]:
+    """Compute global customers, churn, conversion, CLV, CPA, ROI."""
     d = df.copy()
 
-    # Flags (safe if columns are missing)
-    d["is_convert"] = safe_yes_no(d, "Response")
-    d["is_churn"] = safe_yes_no(d, "Churn")
+    n_customers = d["Customer"].nunique()
+    churn_rate = d["Churn"].mean() if "Churn" in d.columns else 0.0
+    conversion_rate = d["conversion_flag"].mean()
 
-    customers = d["Customer"].nunique()
-    conversions = int(d["is_convert"].sum())
-    churns = int(d["is_churn"].sum())
+    # Cost per acquisition, ROI – using channel cost overrides
+    d["channel_cost"] = d["Sales Channel"].map(channel_cost_map).fillna(0.0)
 
-    conversion_rate = conversions / len(d) if len(d) else 0.0
-    churn_rate = churns / len(d) if len(d) else 0.0
+    total_cost = d["channel_cost"].sum()
+    acquired = max(d["conversion_flag"].sum(), 1)  # avoid /0
+    cpa = total_cost / acquired
 
-    # Cost per row based on Sales Channel
-    d["acq_cost"] = d["Sales Channel"].map(channel_cost_map).fillna(0.0)
-    total_spend = float(d["acq_cost"].sum())
+    clv_realized = d.loc[d["conversion_flag"] == 1, "Customer Lifetime Value"].sum()
+    roi = ((clv_realized - total_cost) / total_cost * 100.0) if total_cost > 0 else 0.0
 
-    clv_col = "Customer Lifetime Value"
-    clv_realized = float(d.loc[d["is_convert"] == 1, clv_col].sum())
-    if conversions > 0:
-        avg_clv = float(d.loc[d["is_convert"] == 1, clv_col].mean())
-    else:
-        avg_clv = float(d[clv_col].mean())
-
-    cpa = total_spend / conversions if conversions > 0 else float("nan")
-    revenue = clv_realized
-    roi = (revenue - total_spend) / total_spend * 100.0 if total_spend > 0 else float("nan")
+    avg_clv = d["Customer Lifetime Value"].mean()
 
     return {
-        "customers": customers,
-        "conversions": conversions,
-        "churns": churns,
-        "conversion_rate": conversion_rate,
+        "customers": n_customers,
         "churn_rate": churn_rate,
-        "total_spend": total_spend,
-        "cpa": cpa,
-        "clv_realized": clv_realized,
+        "conversion_rate": conversion_rate,
         "avg_clv": avg_clv,
+        "cpa": cpa,
         "roi": roi,
+        "acquired": acquired,
+        "total_cost": total_cost,
+        "clv_realized": clv_realized,
     }
 
 
-def kpis_by_segment(
-    df: pd.DataFrame,
-    channel_cost_map: Dict[str, float],
-    segment_col: str,
-) -> pd.DataFrame:
-    """
-    Aggregate KPIs by a segment column (e.g., Sales Channel, Renew Offer Type).
-    Returns a DataFrame with customers, conv_rate, churn_rate, CPA, CLV, ROI.
-    """
+def channel_kpis(df: pd.DataFrame, channel_cost_map: Dict[str, float]) -> pd.DataFrame:
     d = df.copy()
-    d["is_convert"] = safe_yes_no(d, "Response")
-    d["is_churn"] = safe_yes_no(d, "Churn")
-    d["acq_cost"] = d["Sales Channel"].map(channel_cost_map).fillna(0.0)
+    d["channel_cost"] = d["Sales Channel"].map(channel_cost_map).fillna(0.0)
 
-    rows = []
-    for seg_value, g in d.groupby(segment_col):
-        customers = g["Customer"].nunique()
-        conversions = int(g["is_convert"].sum())
-        churns = int(g["is_churn"].sum())
-        conv_rate = conversions / len(g) if len(g) else 0.0
-        churn_rate = churns / len(g) if len(g) else 0.0
-        spend = float(g["acq_cost"].sum())
-        cpa = spend / conversions if conversions > 0 else float("nan")
-        clv_real = float(
-            g.loc[g["is_convert"] == 1, "Customer Lifetime Value"].sum()
+    grp = (
+        d.groupby("Sales Channel")
+        .agg(
+            customers=("Customer", "nunique"),
+            leads=("Customer", "size"),
+            converts=("conversion_flag", "sum"),
+            churners=("Churn", "sum"),
+            avg_clv=("Customer Lifetime Value", "mean"),
+            engagement=("EngagementScore", "mean"),
+            cost=("channel_cost", "sum"),
         )
-        roi = (clv_real - spend) / spend * 100.0 if spend > 0 else float("nan")
+        .reset_index()
+    )
 
-        rows.append(
-            {
-                segment_col: seg_value,
-                "customers": customers,
-                "conversion_rate": conv_rate,
-                "churn_rate": churn_rate,
-                "cpa": cpa,
-                "clv_realized": clv_real,
-                "roi": roi,
-            }
-        )
+    grp["conversion_rate"] = grp["converts"] / grp["leads"].clip(lower=1)
+    grp["churn_rate"] = grp["churners"] / grp["customers"].clip(lower=1)
+    grp["cpa"] = grp["cost"] / grp["converts"].clip(lower=1)
+    grp["roi"] = (
+        grp["avg_clv"] * grp["converts"] - grp["cost"]
+    ) / grp["cost"].replace(0, np.nan) * 100.0
 
-    return pd.DataFrame(rows).sort_values("conversion_rate", ascending=False)
-
-
-@st.cache_data
-def load_csv(file) -> pd.DataFrame:
-    """
-    Robust loader for uploaded files:
-    - If the file is Excel (.xls/.xlsx), use pd.read_excel.
-    - If it's CSV, try utf-8 first, then latin1/cp1252 as fallbacks.
-    """
-    name = getattr(file, "name", "").lower()
-
-    # Excel support
-    if name.endswith((".xls", ".xlsx")):
-        return pd.read_excel(file)
-
-    # CSV with encoding fallbacks
-    try:
-        return pd.read_csv(file)  # default utf-8
-    except UnicodeDecodeError:
-        file.seek(0)
-        for enc in ["latin1", "cp1252"]:
-            try:
-                return pd.read_csv(file, encoding=enc)
-            except UnicodeDecodeError:
-                file.seek(0)
-        # If all fail, re-raise the original problem
-        file.seek(0)
-        raise
-
-
-@st.cache_data
-def load_sample_csv(path: str = "data.csv") -> pd.DataFrame:
-    """
-    Robust loader for repo CSV assets (e.g., data.csv, Online Retail CSV).
-    Same encoding logic as load_csv, but for filenames.
-    """
-    # Try utf-8, then fall back to latin1/cp1252
-    try:
-        return pd.read_csv(path)
-    except UnicodeDecodeError:
-        for enc in ["latin1", "cp1252"]:
-            try:
-                return pd.read_csv(path, encoding=enc)
-            except UnicodeDecodeError:
-                continue
-        # If all fail, re-raise
-        raise
-
-
-def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    d = df.copy()
-    for c in cols:
-        if c in d.columns:
-            d[c] = pd.to_numeric(d[c], errors="coerce")
-    return d
+    return grp
 
 
 # -----------------------------------------------------------------------------
-# Sidebar – upload + navigation + schema
+# Sidebar
 # -----------------------------------------------------------------------------
 st.sidebar.title("TopKPI2 📈")
-st.sidebar.caption("Advanced Marketing Growth & Retention Intelligence")
-
-uploaded = st.sidebar.file_uploader(
-    "Upload CSV (same schema as your notebooks)",
-    type=["csv"],
+st.sidebar.caption(
+    "Advanced Marketing Growth & Retention Intelligence\n\n"
+    "Conversion • Churn • CLV • CPA • ROI • Engagement"
 )
 
-# Channel cost overrides (optional)
-with st.sidebar.expander("Cost per Acquisition (override)", expanded=False):
-    web_cost = st.number_input("Web", value=DEFAULT_CHANNEL_COST_MAP["Web"], step=5.0)
-    cc_cost = st.number_input("Call Center", value=DEFAULT_CHANNEL_COST_MAP["Call Center"], step=5.0)
-    branch_cost = st.number_input("Branch", value=DEFAULT_CHANNEL_COST_MAP["Branch"], step=5.0)
-    agent_cost = st.number_input("Agent", value=DEFAULT_CHANNEL_COST_MAP["Agent"], step=5.0)
+st.sidebar.subheader("Cost per Acquisition (override)")
+channel_cost_map = {}
+for ch, default in CHANNEL_COST_DEFAULTS.items():
+    channel_cost_map[ch] = st.sidebar.number_input(
+        ch,
+        min_value=0.0,
+        max_value=10_000.0,
+        value=float(default),
+        step=1.0,
+        key=f"cost_{ch.replace(' ', '_')}",
+    )
 
-CHANNEL_COST_MAP = {
-    "Web": float(web_cost),
-    "Call Center": float(cc_cost),
-    "Branch": float(branch_cost),
-    "Agent": float(agent_cost),
-}
-
-page = st.sidebar.radio(
+st.sidebar.markdown("---")
+view = st.sidebar.radio(
     "Navigate",
     [
         "KPIs overview",
@@ -285,526 +296,487 @@ page = st.sidebar.radio(
     ],
 )
 
-# Placeholder for df – load from upload or sample_data
-df = None
-source_label = ""
+with st.sidebar.expander("Schema checklist", expanded=True):
+    st.markdown("**Marketing data (data.csv)**")
+    st.write("Required columns:")
+    st.code(", ".join(MAIN_REQUIRED_COLS), language="text")
 
-try:
-    if uploaded is not None:
-        df = load_csv(uploaded)
-        source_label = f"Uploaded {uploaded.name}"
+    st.markdown("**Online Retail (for Product Recs & Segmentation)**")
+    st.write("Required columns:")
+    st.code(", ".join(RETAIL_REQUIRED_COLS), language="text")
+
+
+# -----------------------------------------------------------------------------
+# Load marketing dataset once
+# -----------------------------------------------------------------------------
+main_df = load_main_marketing_data()
+if main_df is not None:
+    ok_main, missing_main = check_main_schema(main_df)
+    if not ok_main:
+        st.error(f"Missing required columns for marketing dataset: {missing_main}")
     else:
-        df = load_sample_csv("data.csv")
-        source_label = "Loaded data.csv from repo root"
-except Exception as e:
-    st.error(f"Failed to load data: {e}")
-    df = None
+        st.success(
+            f"Uploaded data.csv with {len(main_df):,} rows and "
+            f"{len(main_df.columns)} columns."
+        )
+        st.dataframe(main_df.head(), use_container_width=True)
+        main_df = prepare_main_df(main_df)
 
-# Schema checklist
-with st.sidebar.expander("Schema checklist", expanded=False):
-    if df is None:
-        st.info("Upload a CSV to run schema checks.")
-    else:
-        missing = [c for c in REQUIRED_COLS if c not in df.columns]
-        extra = [c for c in df.columns if c not in REQUIRED_COLS]
-
-        if not missing:
-            st.success("All expected columns are present. ✅")
-        else:
-            st.error("Missing expected columns: " + ", ".join(missing))
-
-        if extra:
-            st.caption("Extra columns (not used by core KPIs): " + ", ".join(extra))
 
 # -----------------------------------------------------------------------------
-# Main layout – title + data preview
+# View: KPIs overview
 # -----------------------------------------------------------------------------
-st.markdown("## Advanced Marketing Growth & Retention Intelligence (TopKPI2)")
-st.caption(
-    "Conversion • Churn • CLV • CPA • ROI • Engagement — executive-ready analytics for growth and retention."
-)
+def page_kpis_overview(df: pd.DataFrame):
+    st.subheader("KPIs Overview – Growth & Profitability")
 
-if df is None:
-    st.warning("Upload a CSV (or include `data.csv` in the repo root) to begin.")
-    st.stop()
-
-# Light cleaning / coercion
-df = coerce_numeric(
-    df,
-    [
-        "Customer Lifetime Value",
-        "Monthly Premium Auto",
-        "Total Claim Amount",
-        "Income",
-        "EngagementScore",
-    ],
-)
-
-# -------------------------------------------------------------------------
-# NEW: derive Engaged flag from Response (1 if Response == Yes else 0)
-# -------------------------------------------------------------------------
-if "Response" in df.columns:
-    df["Engaged"] = yes_no_flag(df["Response"])
-else:
-    # keep alignment; all zeros if Response is missing
-    df["Engaged"] = 0
-
-st.success(f"{source_label} with {len(df):,} rows and {df.shape[1]} columns.")
-st.markdown("### Data preview")
-st.dataframe(df.head(10), use_container_width=True)
-
-# -----------------------------------------------------------------------------
-# Page: KPIs overview
-# -----------------------------------------------------------------------------
-if page == "KPIs overview":
-    st.markdown("## KPIs Overview – Growth & Profitability")
-
-    kpi = compute_global_kpis(df, CHANNEL_COST_MAP)
+    overall = compute_global_kpis(df, channel_cost_map)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Customers", f"{kpi['customers']:,}")
-    c2.metric("Churn rate", f"{kpi['churn_rate'] * 100:0.1f}%")
-    c3.metric("Conversion rate", f"{kpi['conversion_rate'] * 100:0.1f}%")
-    c4.metric("Average CLV", f"${kpi['avg_clv']:,.0f}")
+    c1.metric("Customers", f"{overall['customers']:,}")
+    c2.metric("Churn rate", f"{overall['churn_rate']*100:,.2f}%")
+    c3.metric("Conversion rate", f"{overall['conversion_rate']*100:,.2f}%")
+    c4.metric("Average CLV", f"${overall['avg_clv']:,.0f}")
 
     c5, c6 = st.columns(2)
-    c5.metric(
-        "CPA (Cost per Acquisition)",
-        f"${kpi['cpa']:,.0f}" if not math.isnan(kpi["cpa"]) else "n/a",
-    )
-    c6.metric(
-        "ROI",
-        f"{kpi['roi']:0.1f}%"
-        if not math.isnan(kpi["roi"])
-        else "n/a",
-    )
+    c5.metric("Cost per Acquisition (CPA)", f"${overall['cpa']:,.0f}")
+    c6.metric("ROI", f"{overall['roi']:,.2f}%")
 
-    # If required KPI-driving fields are missing, gently warn
-    warn_cols = [c for c in ["Response", "Churn", "Customer Lifetime Value", "Sales Channel"] if c not in df.columns]
-    if warn_cols:
-        st.warning(
-            "Some KPI drivers are missing in the data: "
-            + ", ".join(warn_cols)
-            + ". Metrics depending on these may be approximate or zero."
+    with st.expander("How to read this section", expanded=True):
+        st.markdown(
+            """
+- **Customers** – distinct customers in the file.  
+- **Churn rate** – share of customers flagged as churned (`Churn = 1`).  
+- **Conversion rate** – share of rows with `Response = "Yes"`.  
+- **Average CLV** – average `Customer Lifetime Value`.  
+- **CPA** – total channel cost ÷ acquired customers.  
+- **ROI** – (realized CLV – cost) ÷ cost.
+            """
         )
 
-    st.markdown("### How to read this section")
-    st.markdown(
-        """
-- **Customers** – number of unique customers in the file.  
-- **Churn rate** – share of customers labeled as churned (`Churn = Yes`). If `Churn` is missing, this will show 0.0%.  
-- **Conversion rate** – share of rows with a positive response (`Response = Yes`).  
-- **Average CLV** – average *Customer Lifetime Value* for converted customers (falls back to overall mean if none converted).  
-- **CPA** – marketing **cost per acquired customer**, using channel-level cost estimates in the sidebar.  
-- **ROI** – return on investment: realized CLV from converted customers versus total acquisition spend.
-        """
-    )
+    chan_df = channel_kpis(df, channel_cost_map)
 
     st.markdown("### KPIs by acquisition channel")
-    if "Sales Channel" not in df.columns:
-        st.error("Sales Channel column is missing; cannot compute by-channel KPIs.")
-    else:
-        seg_df = kpis_by_segment(df, CHANNEL_COST_MAP, "Sales Channel")
-        st.dataframe(seg_df, use_container_width=True)
+    st.dataframe(chan_df, use_container_width=True)
 
-        if not seg_df.empty:
-            # Conversion rate by channel
-            fig = px.bar(
-                seg_df,
-                x="Sales Channel",
-                y="conversion_rate",
-                text=seg_df["conversion_rate"].mul(100).round(1).astype(str) + "%",
-                labels={"conversion_rate": "Conversion rate"},
-                title="Conversion rate by Sales Channel",
-            )
-            fig.update_traces(textposition="outside")
-            fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
-
-            # ROI by channel
-            fig2 = px.bar(
-                seg_df,
-                x="Sales Channel",
-                y="roi",
-                text=seg_df["roi"].round(1).astype(str) + "%",
-                labels={"roi": "ROI (%)"},
-                title="ROI by Sales Channel",
-            )
-            fig2.update_traces(textposition="outside")
-            st.plotly_chart(fig2, use_container_width=True)
-
-    st.caption(
-        "Use this page for a high-level health check: are we acquiring profitable customers and where is ROI strongest?"
+    fig_conv = px.bar(
+        chan_df,
+        x="Sales Channel",
+        y="conversion_rate",
+        title="Conversion rate by Sales Channel",
+        text=chan_df["conversion_rate"].map(lambda x: f"{x*100:,.1f}%"),
     )
+    fig_conv.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig_conv, use_container_width=True)
+
+    fig_roi = px.bar(
+        chan_df,
+        x="Sales Channel",
+        y="roi",
+        title="ROI by Sales Channel",
+        text=chan_df["roi"].map(lambda x: f"{x:,.1f}%"),
+    )
+    st.plotly_chart(fig_roi, use_container_width=True)
+
 
 # -----------------------------------------------------------------------------
-# Page: Why People Churn
+# View: Why People Churn
 # -----------------------------------------------------------------------------
-elif page == "Why People Churn":
-    st.markdown("## Why People Churn")
+def page_why_churn(df: pd.DataFrame):
+    st.subheader("Why People Churn")
 
-    st.info(
+    st.write(
         "This view shows where churn is highest so marketers can prioritize "
-        "**save-campaigns**, retention journeys, and service interventions."
+        "save-campaigns and service interventions."
     )
 
-    if "Sales Channel" not in df.columns:
-        st.error("Sales Channel is required to analyze churn by segment.")
-    else:
-        segment_options = [
-            "Sales Channel",
-            "Renew Offer Type",
-            "Policy Type",
-            "Coverage",
-            "State",
-            "Vehicle Size",
-        ]
-        segment_col = st.selectbox("View churn by segment", segment_options, index=0)
-
-        seg_df = kpis_by_segment(df, CHANNEL_COST_MAP, segment_col)
-        st.dataframe(seg_df, use_container_width=True)
-
-        if not seg_df.empty:
-            fig = px.bar(
-                seg_df,
-                x=segment_col,
-                y="churn_rate",
-                text=seg_df["churn_rate"].mul(100).round(1).astype(str) + "%",
-                labels={"churn_rate": "Churn rate"},
-                title=f"Churn rate by {segment_col}",
-            )
-            fig.update_traces(textposition="outside")
-            fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        """
-**How to interpret:**  
-Segments with **high churn rate** but **meaningful customers or CLV** should be your top candidates for:
-- Proactive outreach or save programs  
-- Journey redesign (AJO, CRM, call center)  
-- Pricing / benefit reviews  
-"""
+    segment = st.selectbox(
+        "View churn by segment",
+        ["Sales Channel", "State", "Coverage", "Education", "Marital Status"],
     )
 
+    grp = (
+        df.groupby(segment)
+        .agg(
+            customers=("Customer", "nunique"),
+            churners=("Churn", "sum"),
+        )
+        .reset_index()
+    )
+    grp["churn_rate"] = grp["churners"] / grp["customers"].clip(lower=1)
+
+    st.dataframe(grp, use_container_width=True)
+
+    fig = px.bar(
+        grp,
+        x=segment,
+        y="churn_rate",
+        title=f"Churn rate by {segment}",
+        text=grp["churn_rate"].map(lambda x: f"{x*100:,.1f}%"),
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+
 # -----------------------------------------------------------------------------
-# Page: Why People Convert
+# View: Why People Convert
 # -----------------------------------------------------------------------------
-elif page == "Why People Convert":
-    st.markdown("## Why People Convert")
+def page_why_convert(df: pd.DataFrame):
+    st.subheader("Why People Convert")
+
+    st.write(
+        "This view highlights **what drives conversions** – which channels, "
+        "offers, or segments are most effective at turning leads into customers."
+    )
+
+    segment = st.selectbox(
+        "View conversion by",
+        ["Sales Channel", "State", "Renew Offer Type", "Policy Type"],
+    )
+
+    grp = (
+        df.groupby(segment)
+        .agg(
+            leads=("Customer", "size"),
+            converts=("conversion_flag", "sum"),
+        )
+        .reset_index()
+    )
+    grp["conversion_rate"] = grp["converts"] / grp["leads"].clip(lower=1)
+
+    st.dataframe(grp, use_container_width=True)
+
+    fig = px.bar(
+        grp,
+        x=segment,
+        y="conversion_rate",
+        title=f"Conversion rate by {segment}",
+        text=grp["conversion_rate"].map(lambda x: f"{x*100:,.1f}%"),
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# -----------------------------------------------------------------------------
+# View: Why People Engage
+# -----------------------------------------------------------------------------
+def page_why_engage(df: pd.DataFrame):
+    st.subheader("Why People Engage")
 
     st.info(
-        "This view highlights **what drives conversions** — which channels, offers, "
-        "or segments are most effective at turning leads into customers."
+        "This section uses **Response** and **EngagementScore** to understand "
+        "which segments are most engaged.\n\n"
+        "- `Engaged = 1` when `Response = \"Yes\"`.\n"
+        "- `EngagementScore` captures intensity (e.g., clicks, opens, time on site)."
     )
 
-    if "Sales Channel" not in df.columns:
-        st.error("Sales Channel is required to analyze conversion by segment.")
-    else:
-        segment_options = [
-            "Sales Channel",
-            "Renew Offer Type",
-            "Policy Type",
-            "Coverage",
-            "State",
-            "Vehicle Size",
-        ]
-        segment_col = st.selectbox("View conversion by", segment_options, index=0)
-
-        seg_df = kpis_by_segment(df, CHANNEL_COST_MAP, segment_col)
-        st.dataframe(seg_df, use_container_width=True)
-
-        if not seg_df.empty:
-            fig = px.bar(
-                seg_df,
-                x=segment_col,
-                y="conversion_rate",
-                text=seg_df["conversion_rate"].mul(100).round(1).astype(str) + "%",
-                labels={"conversion_rate": "Conversion rate"},
-                title=f"Conversion rate by {segment_col}",
-            )
-            fig.update_traces(textposition="outside")
-            fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
-
-    st.markdown(
-        """
-**How to interpret:**  
-- Segments with **high conversion rate** and **strong ROI** should be prioritized for scaling.  
-- Segments with **low conversion** but **high CLV** may warrant targeted testing to unlock value.  
-"""
+    segment = st.selectbox(
+        "View engagement by",
+        ["Sales Channel", "State", "Coverage", "Education", "Marital Status"],
     )
 
+    grp = (
+        df.groupby(segment)
+        .agg(
+            customers=("Customer", "nunique"),
+            engaged=("Engaged", "sum"),
+            avg_score=("EngagementScore", "mean"),
+        )
+        .reset_index()
+    )
+    grp["engaged_rate"] = grp["engaged"] / grp["customers"].clip(lower=1)
+
+    st.dataframe(grp, use_container_width=True)
+
+    fig = px.bar(
+        grp,
+        x=segment,
+        y="engaged_rate",
+        title=f"Engaged customers by {segment}",
+        text=grp["engaged_rate"].map(lambda x: f"{x*100:,.1f}%"),
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+    fig2 = px.bar(
+        grp,
+        x=segment,
+        y="avg_score",
+        title=f"Average EngagementScore by {segment}",
+        text=grp["avg_score"].map(lambda x: f"{x:,.1f}"),
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
+
 # -----------------------------------------------------------------------------
-# Page: Why People Engage  (UPDATED)
+# View: Time Series Analysis
 # -----------------------------------------------------------------------------
-elif page == "Why People Engage":
-    st.markdown("## Why People Engage")
+def page_time_series(df: pd.DataFrame):
+    st.subheader("Time Series Analysis")
+
+    st.write(
+        "This view looks at conversions and churn over time, using "
+        "`Effective To Date` as a proxy for campaign period."
+    )
+
+    ts = df.dropna(subset=["Effective To Date"]).copy()
+    ts["date"] = ts["Effective To Date"].dt.to_period("M").dt.to_timestamp()
+
+    grp = (
+        ts.groupby("date")
+        .agg(
+            customers=("Customer", "size"),
+            converts=("conversion_flag", "sum"),
+            churners=("Churn", "sum"),
+        )
+        .reset_index()
+    )
+    grp["conversion_rate"] = grp["converts"] / grp["customers"].clip(lower=1)
+    grp["churn_rate"] = grp["churners"] / grp["customers"].clip(lower=1)
+
+    st.dataframe(grp, use_container_width=True)
+
+    fig = px.line(
+        grp,
+        x="date",
+        y=["conversion_rate", "churn_rate"],
+        title="Conversion vs Churn over time",
+    )
+    fig.update_yaxes(tickformat=".0%")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# -----------------------------------------------------------------------------
+# View: Sentiment Analysis (placeholder)
+# -----------------------------------------------------------------------------
+def page_sentiment(df: pd.DataFrame):
+    st.subheader("Sentiment Analysis (placeholder)")
 
     st.info(
-        "This section focuses on **Engaged customers** — where `Response = Yes` — "
-        "and, when available, their **EngagementScore**. It helps you see which "
-        "segments lean in, click, or open at higher rates."
+        "In this dataset we don’t yet have free-text feedback, call notes, or "
+        "survey comments. In a real deployment, this section would:\n\n"
+        "- Ingest NPS comments, call center notes, or email bodies.\n"
+        "- Run NLP to derive sentiment scores and topics.\n"
+        "- Tie those scores back to **Churn**, **EngagementScore**, and **CLV**."
     )
 
-    if "Response" not in df.columns:
-        st.error(
-            "The `Response` column is required to derive the Engaged flag "
-            "(Engaged = 1 when Response = 'Yes')."
-        )
-    else:
-        seg_col = st.selectbox(
-            "View engagement by segment",
-            ["Sales Channel", "State", "Renew Offer Type", "Policy Type", "Coverage"],
-            index=0,
-        )
 
-        has_eng_score = "EngagementScore" in df.columns
+# -----------------------------------------------------------------------------
+# View: Predictive Analytics (placeholder)
+# -----------------------------------------------------------------------------
+def page_predictive(df: pd.DataFrame):
+    st.subheader("Predictive Analytics (placeholder)")
 
-        agg_dict = {
-            "customers": ("Customer", "nunique"),
-            "engaged_customers": ("Engaged", "sum"),
-            "engaged_rate": ("Engaged", "mean"),
-        }
-        if has_eng_score:
-            agg_dict["avg_engagement"] = ("EngagementScore", "mean")
-            agg_dict["avg_clv"] = ("Customer Lifetime Value", "mean")
+    st.info(
+        "This section is where you’d plug in a production-grade model "
+        "(e.g., gradient boosting, XGBoost, or your Stacking GenAI model) "
+        "to score each customer for **churn risk**, **conversion propensity**, "
+        "or **upsell likelihood**.\n\n"
+        "The current app focuses on interpretable KPI slices, but the same "
+        "schema can feed more advanced models."
+    )
 
-        g = (
-            df.groupby(seg_col)
-            .agg(**agg_dict)
-            .reset_index()
-            .sort_values("engaged_rate", ascending=False)
-        )
 
-        st.dataframe(g, use_container_width=True)
+# -----------------------------------------------------------------------------
+# View: Product Recommendations (Online Retail dataset)
+# -----------------------------------------------------------------------------
+def page_product_recs():
+    st.subheader("Product Recommendations")
 
-        if not g.empty:
-            # Engaged rate bar chart
-            fig = px.bar(
-                g,
-                x=seg_col,
-                y="engaged_rate",
-                text=g["engaged_rate"].mul(100).round(1).astype(str) + "%",
-                labels={"engaged_rate": "Engaged rate (Response = Yes)"},
-                title=f"Engaged rate by {seg_col}",
-            )
-            fig.update_traces(textposition="outside")
-            fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
+    st.write(
+        "This view suggests **“people who bought X also bought Y”** using the "
+        "Online Retail dataset. It looks at products that co-occur on the same "
+        "invoices and surfaces the top companion items."
+    )
 
-            # Optional EngagementScore chart
-            if has_eng_score:
-                fig2 = px.bar(
-                    g,
-                    x=seg_col,
-                    y="avg_engagement",
-                    text=g["avg_engagement"].round(1),
-                    labels={"avg_engagement": "Average EngagementScore"},
-                    title=f"Average EngagementScore by {seg_col}",
-                )
-                fig2.update_traces(textposition="outside")
-                st.plotly_chart(fig2, use_container_width=True)
+    retail_df = load_online_retail(upload_key="retail_csv_for_recs")
+    if retail_df is None:
+        return
 
+    ok, missing = check_retail_schema(retail_df)
+    if not ok:
+        st.error(f"Missing required columns for Online Retail dataset: {missing}")
+        return
+
+    # Basic cleaning
+    df = retail_df.copy()
+    df = df.dropna(subset=["InvoiceNo", "StockCode", "Description", "CustomerID"])
+    df["Quantity"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0)
+    df = df[df["Quantity"] > 0]
+
+    st.markdown("#### Top Selling Products")
+    top_products = (
+        df.groupby("Description")["Quantity"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(30)
+        .reset_index()
+    )
+    st.dataframe(top_products, use_container_width=True)
+
+    base_product = st.selectbox(
+        "Choose a base product to recommend from:",
+        options=top_products["Description"],
+    )
+
+    base_invoices = df.loc[df["Description"] == base_product, "InvoiceNo"].unique()
+    co_df = df[df["InvoiceNo"].isin(base_invoices)]
+    co_df = co_df[co_df["Description"] != base_product]
+
+    if co_df.empty:
+        st.warning("No co-purchases found for this product (in this sample).")
+        return
+
+    co_counts = (
+        co_df.groupby("Description")["Quantity"]
+        .sum()
+        .sort_values(ascending=False)
+        .head(10)
+        .reset_index(name="co_purchase_quantity")
+    )
+
+    st.markdown(f"#### Frequently bought with **{base_product}**")
+    st.dataframe(co_counts, use_container_width=True)
+
+    fig = px.bar(
+        co_counts,
+        x="Description",
+        y="co_purchase_quantity",
+        title=f"Top companion products for {base_product}",
+        text="co_purchase_quantity",
+    )
+    fig.update_layout(xaxis_tickangle=-40)
+    st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander("How to use this section"):
         st.markdown(
             """
-**How to interpret:**  
-
-- **Engaged rate** shows where customers are most responsive (`Response = Yes`).  
-- Segments with **high engaged rate** and **strong CLV** are ideal for cross-sell, upsell, and advocacy programs.  
-- Segments with **low engaged rate** or **low EngagementScore** may need refreshed messaging, new offers, or different channels/frequency.  
-"""
+- Use this table to design **bundle offers** and **cross-sell campaigns**.  
+- The logic is simple, transparent co-occurrence (no black-box model).  
+- You can export the table and join it back to your product master for pricing and attribution.
+            """
         )
 
+
 # -----------------------------------------------------------------------------
-# Page: Time Series Analysis
+# View: Customer Segmentation (Online Retail dataset)
 # -----------------------------------------------------------------------------
-elif page == "Time Series Analysis":
-    st.markdown("## Time Series Analysis")
-    st.info(
-        "Coming soon: trends over time in conversion, churn, CLV and engagement. "
-        "This view will use `Effective To Date` to group by week/month."
+def page_customer_segmentation():
+    st.subheader("Customer Segmentation")
+
+    st.write(
+        "This view clusters customers into actionable segments using an "
+        "**RFM approach** (Recency, Frequency, Monetary) based on the "
+        "Online Retail dataset."
     )
 
-    if "Effective To Date" in df.columns and "Response" in df.columns:
-        d = df.copy()
-        d["Effective To Date"] = pd.to_datetime(d["Effective To Date"], errors="coerce")
-        d = d.dropna(subset=["Effective To Date"])
-        d["month"] = d["Effective To Date"].dt.to_period("M").dt.to_timestamp()
-        d["is_convert"] = safe_yes_no(d, "Response")
+    retail_df = load_online_retail(upload_key="retail_csv_for_seg")
+    if retail_df is None:
+        return
 
-        ts = (
-            d.groupby("month")
-            .agg(
-                customers=("Customer", "nunique"),
-                conversion_rate=("is_convert", "mean"),
-            )
-            .reset_index()
+    ok, missing = check_retail_schema(retail_df)
+    if not ok:
+        st.error(f"Missing required columns for Online Retail dataset: {missing}")
+        return
+
+    df = retail_df.copy()
+    df = df.dropna(subset=["InvoiceNo", "CustomerID", "InvoiceDate"])
+    df["InvoiceDate"] = pd.to_datetime(df["InvoiceDate"], errors="coerce")
+    df = df.dropna(subset=["InvoiceDate"])
+
+    df["Amount"] = pd.to_numeric(df["Quantity"], errors="coerce").fillna(0) * pd.to_numeric(
+        df["UnitPrice"], errors="coerce"
+    ).fillna(0)
+    df = df[df["Amount"] > 0]
+
+    snapshot_date = df["InvoiceDate"].max() + pd.Timedelta(days=1)
+
+    rfm = (
+        df.groupby("CustomerID")
+        .agg(
+            recency=("InvoiceDate", lambda x: (snapshot_date - x.max()).days),
+            frequency=("InvoiceNo", "nunique"),
+            monetary=("Amount", "sum"),
         )
-        st.dataframe(ts, use_container_width=True)
-
-        fig = px.line(
-            ts,
-            x="month",
-            y="conversion_rate",
-            markers=True,
-            labels={"conversion_rate": "Conversion rate"},
-            title="Conversion rate over time",
-        )
-        fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
-
-# -----------------------------------------------------------------------------
-# Page: Sentiment Analysis
-# -----------------------------------------------------------------------------
-elif page == "Sentiment Analysis":
-    st.markdown("## Sentiment Analysis")
-    st.info(
-        "This section is reserved for NLP-based sentiment scoring on call notes, emails, "
-        "or survey verbatims. It will expect a `SentimentScore` or text column in future versions."
+        .reset_index()
     )
 
-# -----------------------------------------------------------------------------
-# Page: Predictive Analytics
-# -----------------------------------------------------------------------------
-elif page == "Predictive Analytics":
-    st.markdown("## Predictive Analytics")
-    st.info(
-        "This page will host uplift / propensity models for conversion and churn "
-        "(e.g., Random Forest, XGBoost, and Stacking Generative AI). "
-        "In the current version, the calibrated KPIs and by-segment views already "
-        "provide strong guidance for targeting and experimentation."
+    st.markdown("#### RFM summary")
+    st.dataframe(rfm.head(), use_container_width=True)
+
+    # KMeans clustering
+    features = rfm[["recency", "frequency", "monetary"]].copy()
+    scaler = StandardScaler()
+    X = scaler.fit_transform(features)
+
+    k = st.slider("Number of segments (k-means clusters)", 3, 8, value=4, step=1)
+    model = KMeans(n_clusters=k, random_state=42, n_init="auto")
+    rfm["segment"] = model.fit_predict(X)
+
+    st.markdown("#### Segment profile (avg RFM by cluster)")
+    seg_profile = (
+        rfm.groupby("segment")
+        .agg(
+            customers=("CustomerID", "nunique"),
+            avg_recency=("recency", "mean"),
+            avg_frequency=("frequency", "mean"),
+            avg_monetary=("monetary", "mean"),
+        )
+        .reset_index()
     )
+    st.dataframe(seg_profile, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Page: Product Recommendations
-# -----------------------------------------------------------------------------
-elif page == "Product Recommendations":
-    st.markdown("## Product Recommendations")
-    st.info(
-        "This section will surface personalized product or coverage recommendations "
-        "based on CLV, risk, and engagement patterns (e.g., association rules or "
-        "matrix factorization on policy holdings)."
+    fig = px.scatter_3d(
+        rfm,
+        x="recency",
+        y="frequency",
+        z="monetary",
+        color="segment",
+        title="RFM Segments (3D view)",
     )
+    st.plotly_chart(fig, use_container_width=True)
 
-# -----------------------------------------------------------------------------
-# Page: Customer Segmentation – Online Retail dataset
-# -----------------------------------------------------------------------------
-elif page == "Customer Segmentation":
-    st.markdown("## Customer Segmentation ↪️")
-
-    st.info(
-        "This view is designed for the **Online Retail** dataset from the UCI repository. "
-        "Upload that CSV to discover data-driven customer segments using RFM (Recency, "
-        "Frequency, Monetary) clustering."
-    )
-
-    retail_required = [
-        "CustomerID",
-        "InvoiceNo",
-        "InvoiceDate",
-        "Quantity",
-        "UnitPrice",
-        "Country",
-    ]
-
-    if not all(c in df.columns for c in retail_required):
-        st.warning(
-            "To use this page, upload the Online Retail dataset (or a dataset with at "
-            "least these columns): "
-            + ", ".join(retail_required)
-        )
-    else:
-        retail = df.copy()
-
-        # Basic cleaning
-        retail = retail.dropna(subset=["CustomerID"])
-        retail = retail[retail["Quantity"] > 0]
-        retail = retail[retail["UnitPrice"] > 0]
-
-        retail["InvoiceDate"] = pd.to_datetime(retail["InvoiceDate"], errors="coerce")
-        retail = retail.dropna(subset=["InvoiceDate"])
-
-        retail["TotalPrice"] = retail["Quantity"] * retail["UnitPrice"]
-
-        snapshot_date = retail["InvoiceDate"].max() + pd.Timedelta(days=1)
-
-        rfm = (
-            retail.groupby("CustomerID")
-            .agg(
-                Recency=("InvoiceDate", lambda x: (snapshot_date - x.max()).days),
-                Frequency=("InvoiceNo", "nunique"),
-                Monetary=("TotalPrice", "sum"),
-                Country=("Country", lambda x: x.mode().iat[0] if len(x.mode()) > 0 else "Unknown"),
-            )
-            .reset_index()
-        )
-
-        st.markdown("### RFM customer table (sample)")
-        st.dataframe(rfm.head(20), use_container_width=True)
-
-        # Scale and cluster
-        features = rfm[["Recency", "Frequency", "Monetary"]].copy()
-        scaler = StandardScaler()
-        X = scaler.fit_transform(features)
-
-        k = st.slider("Number of segments (k)", min_value=3, max_value=8, value=4, step=1)
-
-        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
-        rfm["Segment"] = kmeans.fit_predict(X)
-
-        # Segment profiles
-        seg_summary = (
-            rfm.groupby("Segment")
-            .agg(
-                customers=("CustomerID", "nunique"),
-                avg_recency=("Recency", "mean"),
-                avg_frequency=("Frequency", "mean"),
-                avg_monetary=("Monetary", "mean"),
-            )
-            .reset_index()
-            .sort_values("Segment")
-        )
-
-        st.markdown("### Segment profiles")
-        st.dataframe(seg_summary, use_container_width=True)
-
-        # Scatter plot (R vs M, bubble = Frequency)
-        fig = px.scatter(
-            rfm,
-            x="Recency",
-            y="Monetary",
-            size="Frequency",
-            color="Segment",
-            hover_data=["CustomerID", "Country"],
-            title="Customer segments (Recency vs Monetary, bubble = Frequency)",
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
+    with st.expander("How to read this section", expanded=True):
         st.markdown(
             """
-### How to use these segments
+- **Recency** – days since the customer's last purchase.  
+- **Frequency** – number of distinct invoices.  
+- **Monetary** – total revenue from the customer.  
 
-- **Low Recency, High Monetary, High Frequency**  
-  Loyal, high-value customers – ideal for VIP benefits, referrals, and cross-sell.
-
-- **High Recency (haven't purchased recently)**  
-  At-risk or lapsed customers – target with win-back campaigns and tailored offers.
-
-- **Low Monetary, Low Frequency**  
-  Price-sensitive or low-engagement – experiment with entry-level bundles and friction reduction.
-
-You can download the RFM+Segment table from the top-right of the data grid and join it
-back to your marketing systems for targeting.
-"""
+Typical patterns:  
+- **High frequency & monetary, low recency** → VIP / loyal.  
+- **Low frequency & monetary, high recency** → churn-risk or one-time buyers.  
+- Use segments to tailor **loyalty**, **reactivation**, and **cross-sell** campaigns.
+            """
         )
 
+
 # -----------------------------------------------------------------------------
-# Footer
+# Router
 # -----------------------------------------------------------------------------
+if main_df is None and view not in ["Product Recommendations", "Customer Segmentation"]:
+    st.stop()
+
+if view == "KPIs overview" and main_df is not None:
+    page_kpis_overview(main_df)
+elif view == "Why People Churn" and main_df is not None:
+    page_why_churn(main_df)
+elif view == "Why People Convert" and main_df is not None:
+    page_why_convert(main_df)
+elif view == "Why People Engage" and main_df is not None:
+    page_why_engage(main_df)
+elif view == "Time Series Analysis" and main_df is not None:
+    page_time_series(main_df)
+elif view == "Sentiment Analysis" and main_df is not None:
+    page_sentiment(main_df)
+elif view == "Predictive Analytics" and main_df is not None:
+    page_predictive(main_df)
+elif view == "Product Recommendations":
+    page_product_recs()
+elif view == "Customer Segmentation":
+    page_customer_segmentation()
+
 st.markdown(
-    "<p style='text-align:center;color:gray;font-size:12px;margin-top:2rem;'>"
-    "© 2025 Howard Nguyen, PhD – TopKPI2 • AI-powered growth, retention & profitability"
-    "</p>",
+    "<br><center>© 2025 Howard Nguyen, PhD — TopKPI2 • AI-powered growth, "
+    "retention & profitability</center>",
     unsafe_allow_html=True,
 )
