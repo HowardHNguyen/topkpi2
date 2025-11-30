@@ -340,6 +340,15 @@ df = coerce_numeric(
     ],
 )
 
+# -------------------------------------------------------------------------
+# NEW: derive Engaged flag from Response (1 if Response == Yes else 0)
+# -------------------------------------------------------------------------
+if "Response" in df.columns:
+    df["Engaged"] = yes_no_flag(df["Response"])
+else:
+    # keep alignment; all zeros if Response is missing
+    df["Engaged"] = 0
+
 st.success(f"{source_label} with {len(df):,} rows and {df.shape[1]} columns.")
 st.markdown("### Data preview")
 st.dataframe(df.head(10), use_container_width=True)
@@ -527,20 +536,21 @@ elif page == "Why People Convert":
     )
 
 # -----------------------------------------------------------------------------
-# Page: Why People Engage
+# Page: Why People Engage  (UPDATED)
 # -----------------------------------------------------------------------------
 elif page == "Why People Engage":
     st.markdown("## Why People Engage")
 
     st.info(
-        "This section focuses on **EngagementScore** to show where customers are most active "
-        "and which segments may need nurture or reactivation."
+        "This section focuses on **Engaged customers** — where `Response = Yes` — "
+        "and, when available, their **EngagementScore**. It helps you see which "
+        "segments lean in, click, or open at higher rates."
     )
 
-    if "EngagementScore" not in df.columns:
+    if "Response" not in df.columns:
         st.error(
-            "EngagementScore column is missing. "
-            "Add it to your dataset to unlock this view."
+            "The `Response` column is required to derive the Engaged flag "
+            "(Engaged = 1 when Response = 'Yes')."
         )
     else:
         seg_col = st.selectbox(
@@ -548,36 +558,61 @@ elif page == "Why People Engage":
             ["Sales Channel", "State", "Renew Offer Type", "Policy Type", "Coverage"],
             index=0,
         )
+
+        has_eng_score = "EngagementScore" in df.columns
+
+        agg_dict = {
+            "customers": ("Customer", "nunique"),
+            "engaged_customers": ("Engaged", "sum"),
+            "engaged_rate": ("Engaged", "mean"),
+        }
+        if has_eng_score:
+            agg_dict["avg_engagement"] = ("EngagementScore", "mean")
+            agg_dict["avg_clv"] = ("Customer Lifetime Value", "mean")
+
         g = (
             df.groupby(seg_col)
-            .agg(
-                customers=("Customer", "nunique"),
-                avg_engagement=("EngagementScore", "mean"),
-                avg_clv=("Customer Lifetime Value", "mean"),
-            )
+            .agg(**agg_dict)
             .reset_index()
-            .sort_values("avg_engagement", ascending=False)
+            .sort_values("engaged_rate", ascending=False)
         )
 
         st.dataframe(g, use_container_width=True)
 
         if not g.empty:
+            # Engaged rate bar chart
             fig = px.bar(
                 g,
                 x=seg_col,
-                y="avg_engagement",
-                text=g["avg_engagement"].round(1),
-                labels={"avg_engagement": "Average EngagementScore"},
-                title=f"Average engagement by {seg_col}",
+                y="engaged_rate",
+                text=g["engaged_rate"].mul(100).round(1).astype(str) + "%",
+                labels={"engaged_rate": "Engaged rate (Response = Yes)"},
+                title=f"Engaged rate by {seg_col}",
             )
             fig.update_traces(textposition="outside")
+            fig.update_yaxes(tickformat=".0%")
             st.plotly_chart(fig, use_container_width=True)
+
+            # Optional EngagementScore chart
+            if has_eng_score:
+                fig2 = px.bar(
+                    g,
+                    x=seg_col,
+                    y="avg_engagement",
+                    text=g["avg_engagement"].round(1),
+                    labels={"avg_engagement": "Average EngagementScore"},
+                    title=f"Average EngagementScore by {seg_col}",
+                )
+                fig2.update_traces(textposition="outside")
+                st.plotly_chart(fig2, use_container_width=True)
 
         st.markdown(
             """
 **How to interpret:**  
-- High engagement segments are prime for cross-sell, upsell, and advocacy programs.  
-- Low engagement segments may need refreshed messaging, frequency, or channel mixes.  
+
+- **Engaged rate** shows where customers are most responsive (`Response = Yes`).  
+- Segments with **high engaged rate** and **strong CLV** are ideal for cross-sell, upsell, and advocacy programs.  
+- Segments with **low engaged rate** or **low EngagementScore** may need refreshed messaging, new offers, or different channels/frequency.  
 """
         )
 
@@ -653,7 +688,7 @@ elif page == "Product Recommendations":
     )
 
 # -----------------------------------------------------------------------------
-# Page: Customer Segmentation – now implemented for Online Retail dataset
+# Page: Customer Segmentation – Online Retail dataset
 # -----------------------------------------------------------------------------
 elif page == "Customer Segmentation":
     st.markdown("## Customer Segmentation ↪️")
