@@ -5,6 +5,8 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
 
 # -----------------------------------------------------------------------------
 # Page & basic theming
@@ -543,7 +545,7 @@ elif page == "Why People Engage":
         )
 
 # -----------------------------------------------------------------------------
-# Remaining pages – placeholders (ready for enhancement)
+# Page: Time Series Analysis
 # -----------------------------------------------------------------------------
 elif page == "Time Series Analysis":
     st.markdown("## Time Series Analysis")
@@ -580,7 +582,9 @@ elif page == "Time Series Analysis":
         fig.update_yaxes(tickformat=".0%")
         st.plotly_chart(fig, use_container_width=True)
 
-
+# -----------------------------------------------------------------------------
+# Page: Sentiment Analysis
+# -----------------------------------------------------------------------------
 elif page == "Sentiment Analysis":
     st.markdown("## Sentiment Analysis")
     st.info(
@@ -588,7 +592,9 @@ elif page == "Sentiment Analysis":
         "or survey verbatims. It will expect a `SentimentScore` or text column in future versions."
     )
 
-
+# -----------------------------------------------------------------------------
+# Page: Predictive Analytics
+# -----------------------------------------------------------------------------
 elif page == "Predictive Analytics":
     st.markdown("## Predictive Analytics")
     st.info(
@@ -598,7 +604,9 @@ elif page == "Predictive Analytics":
         "provide strong guidance for targeting and experimentation."
     )
 
-
+# -----------------------------------------------------------------------------
+# Page: Product Recommendations
+# -----------------------------------------------------------------------------
 elif page == "Product Recommendations":
     st.markdown("## Product Recommendations")
     st.info(
@@ -607,14 +615,117 @@ elif page == "Product Recommendations":
         "matrix factorization on policy holdings)."
     )
 
-
+# -----------------------------------------------------------------------------
+# Page: Customer Segmentation – now implemented for Online Retail dataset
+# -----------------------------------------------------------------------------
 elif page == "Customer Segmentation":
-    st.markdown("## Customer Segmentation")
+    st.markdown("## Customer Segmentation ↪️")
+
     st.info(
-        "This view will cluster customers into actionable segments (e.g., k-means on "
-        "CLV, engagement, channel preference, and demographics) and display profiles "
-        "to inform strategy, creative, and measurement."
+        "This view is designed for the **Online Retail** dataset from the UCI repository. "
+        "Upload that CSV to discover data-driven customer segments using RFM (Recency, "
+        "Frequency, Monetary) clustering."
     )
+
+    retail_required = [
+        "CustomerID",
+        "InvoiceNo",
+        "InvoiceDate",
+        "Quantity",
+        "UnitPrice",
+        "Country",
+    ]
+
+    if not all(c in df.columns for c in retail_required):
+        st.warning(
+            "To use this page, upload the Online Retail dataset (or a dataset with at "
+            "least these columns): "
+            + ", ".join(retail_required)
+        )
+    else:
+        retail = df.copy()
+
+        # Basic cleaning
+        retail = retail.dropna(subset=["CustomerID"])
+        retail = retail[retail["Quantity"] > 0]
+        retail = retail[retail["UnitPrice"] > 0]
+
+        retail["InvoiceDate"] = pd.to_datetime(retail["InvoiceDate"], errors="coerce")
+        retail = retail.dropna(subset=["InvoiceDate"])
+
+        retail["TotalPrice"] = retail["Quantity"] * retail["UnitPrice"]
+
+        snapshot_date = retail["InvoiceDate"].max() + pd.Timedelta(days=1)
+
+        rfm = (
+            retail.groupby("CustomerID")
+            .agg(
+                Recency=("InvoiceDate", lambda x: (snapshot_date - x.max()).days),
+                Frequency=("InvoiceNo", "nunique"),
+                Monetary=("TotalPrice", "sum"),
+                Country=("Country", lambda x: x.mode().iat[0] if len(x.mode()) > 0 else "Unknown"),
+            )
+            .reset_index()
+        )
+
+        st.markdown("### RFM customer table (sample)")
+        st.dataframe(rfm.head(20), use_container_width=True)
+
+        # Scale and cluster
+        features = rfm[["Recency", "Frequency", "Monetary"]].copy()
+        scaler = StandardScaler()
+        X = scaler.fit_transform(features)
+
+        k = st.slider("Number of segments (k)", min_value=3, max_value=8, value=4, step=1)
+
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        rfm["Segment"] = kmeans.fit_predict(X)
+
+        # Segment profiles
+        seg_summary = (
+            rfm.groupby("Segment")
+            .agg(
+                customers=("CustomerID", "nunique"),
+                avg_recency=("Recency", "mean"),
+                avg_frequency=("Frequency", "mean"),
+                avg_monetary=("Monetary", "mean"),
+            )
+            .reset_index()
+            .sort_values("Segment")
+        )
+
+        st.markdown("### Segment profiles")
+        st.dataframe(seg_summary, use_container_width=True)
+
+        # Scatter plot (R vs M, bubble = Frequency)
+        fig = px.scatter(
+            rfm,
+            x="Recency",
+            y="Monetary",
+            size="Frequency",
+            color="Segment",
+            hover_data=["CustomerID", "Country"],
+            title="Customer segments (Recency vs Monetary, bubble = Frequency)",
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown(
+            """
+### How to use these segments
+
+- **Low Recency, High Monetary, High Frequency**  
+  Loyal, high-value customers – ideal for VIP benefits, referrals, and cross-sell.
+
+- **High Recency (haven't purchased recently)**  
+  At-risk or lapsed customers – target with win-back campaigns and tailored offers.
+
+- **Low Monetary, Low Frequency**  
+  Price-sensitive or low-engagement – experiment with entry-level bundles and friction reduction.
+
+You can download the RFM+Segment table from the top-right of the data grid and join it
+back to your marketing systems for targeting.
+"""
+        )
 
 # -----------------------------------------------------------------------------
 # Footer
