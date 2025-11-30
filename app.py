@@ -192,12 +192,49 @@ def kpis_by_segment(
 
 @st.cache_data
 def load_csv(file) -> pd.DataFrame:
-    return pd.read_csv(file)
+    """
+    Robust loader for uploaded files:
+    - If the file is Excel (.xls/.xlsx), use pd.read_excel.
+    - If it's CSV, try utf-8 first, then latin1/cp1252 as fallbacks.
+    """
+    name = getattr(file, "name", "").lower()
+
+    # Excel support
+    if name.endswith((".xls", ".xlsx")):
+        return pd.read_excel(file)
+
+    # CSV with encoding fallbacks
+    try:
+        return pd.read_csv(file)  # default utf-8
+    except UnicodeDecodeError:
+        file.seek(0)
+        for enc in ["latin1", "cp1252"]:
+            try:
+                return pd.read_csv(file, encoding=enc)
+            except UnicodeDecodeError:
+                file.seek(0)
+        # If all fail, re-raise the original problem
+        file.seek(0)
+        raise
 
 
 @st.cache_data
 def load_sample_csv(path: str = "data.csv") -> pd.DataFrame:
-    return pd.read_csv(path)
+    """
+    Robust loader for repo CSV assets (e.g., data.csv, Online Retail CSV).
+    Same encoding logic as load_csv, but for filenames.
+    """
+    # Try utf-8, then fall back to latin1/cp1252
+    try:
+        return pd.read_csv(path)
+    except UnicodeDecodeError:
+        for enc in ["latin1", "cp1252"]:
+            try:
+                return pd.read_csv(path, encoding=enc)
+            except UnicodeDecodeError:
+                continue
+        # If all fail, re-raise
+        raise
 
 
 def coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
