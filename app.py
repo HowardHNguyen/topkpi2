@@ -57,10 +57,10 @@ REQUIRED_COLS: List[str] = [
     "Total Claim Amount",
     "Vehicle Class",
     "Vehicle Size",
-    # New expected fields:
-    "Churn",
-    "EngagementScore",
 ]
+
+# Optional fields: enable extra metrics when present, never required
+OPTIONAL_COLS: List[str] = ["Churn", "EngagementScore"]
 
 # Default cost assumptions by channel – override via sidebar
 DEFAULT_CHANNEL_COST_MAP: Dict[str, float] = {
@@ -306,12 +306,18 @@ with st.sidebar.expander("Schema checklist", expanded=False):
         st.info("Upload a CSV to run schema checks.")
     else:
         missing = [c for c in REQUIRED_COLS if c not in df.columns]
-        extra = [c for c in df.columns if c not in REQUIRED_COLS]
+        missing_optional = [c for c in OPTIONAL_COLS if c not in df.columns]
+        extra = [c for c in df.columns if c not in REQUIRED_COLS + OPTIONAL_COLS]
 
         if not missing:
-            st.success("All expected marketing columns are present. ✅")
+            st.success("All required marketing columns are present. ✅")
         else:
-            st.error("Missing expected marketing columns: " + ", ".join(missing))
+            st.warning(
+                "Missing marketing columns (needed for the KPI pages; not needed "
+                "for Online Retail pages): " + ", ".join(missing)
+            )
+        if missing_optional:
+            st.caption("Optional columns not found: " + ", ".join(missing_optional))
 
         if extra:
             st.caption("Extra columns (not used by core KPIs): " + ", ".join(extra))
@@ -348,7 +354,7 @@ else:
 
 st.success(f"{source_label} with {len(df):,} rows and {df.shape[1]} columns.")
 st.markdown("### Data preview")
-st.dataframe(df.head(10), use_container_width=True)
+st.dataframe(df.head(10), width="stretch")
 
 # -----------------------------------------------------------------------------
 # Page: KPIs overview
@@ -356,11 +362,23 @@ st.dataframe(df.head(10), use_container_width=True)
 if page == "KPIs overview":
     st.markdown("## KPIs Overview – Growth & Profitability")
 
+    kpi_required = ["Customer", "Customer Lifetime Value", "Sales Channel", "Response"]
+    kpi_missing = [c for c in kpi_required if c not in df.columns]
+    if kpi_missing:
+        st.error(
+            "This page needs the marketing dataset. Missing columns: "
+            + ", ".join(kpi_missing)
+        )
+        st.stop()
+
     kpi = compute_global_kpis(df, CHANNEL_COST_MAP)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Customers", f"{kpi['customers']:,}")
-    c2.metric("Churn rate", f"{kpi['churn_rate'] * 100:0.1f}%")
+    c2.metric(
+        "Churn rate",
+        f"{kpi['churn_rate'] * 100:0.1f}%" if "Churn" in df.columns else "n/a",
+    )
     c3.metric("Conversion rate", f"{kpi['conversion_rate'] * 100:0.1f}%")
     c4.metric("Average CLV", f"${kpi['avg_clv']:,.0f}")
 
@@ -376,19 +394,14 @@ if page == "KPIs overview":
         else "n/a",
     )
 
-    warn_cols = [c for c in ["Response", "Churn", "Customer Lifetime Value", "Sales Channel"] if c not in df.columns]
-    if warn_cols:
-        st.warning(
-            "Some KPI drivers are missing in the data: "
-            + ", ".join(warn_cols)
-            + ". Metrics depending on these may be approximate or zero."
-        )
+    if "Churn" not in df.columns:
+        st.info("No `Churn` column in this dataset, so churn rate is not available.")
 
     st.markdown("### How to read this section")
     st.markdown(
         """
 - **Customers** – number of unique customers in the file.  
-- **Churn rate** – share of customers labeled as churned (`Churn = Yes`). If `Churn` is missing, this will show 0.0%.  
+- **Churn rate** – share of customers labeled as churned (`Churn = Yes`). If `Churn` is missing, this shows n/a.  
 - **Conversion rate** – share of rows with a positive response (`Response = Yes`).  
 - **Average CLV** – average *Customer Lifetime Value* for converted customers (falls back to overall mean if none converted).  
 - **CPA** – marketing **cost per acquired customer**, using channel-level cost estimates in the sidebar.  
@@ -401,7 +414,7 @@ if page == "KPIs overview":
         st.error("Sales Channel column is missing; cannot compute by-channel KPIs.")
     else:
         seg_df = kpis_by_segment(df, CHANNEL_COST_MAP, "Sales Channel")
-        st.dataframe(seg_df, use_container_width=True)
+        st.dataframe(seg_df, width="stretch")
 
         if not seg_df.empty:
             fig = px.bar(
@@ -414,18 +427,18 @@ if page == "KPIs overview":
             )
             fig.update_traces(textposition="outside")
             fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             fig2 = px.bar(
                 seg_df,
                 x="Sales Channel",
                 y="roi",
-                text=seg_df["roi"].round(1).astype(str) + "%",
+                text=seg_df["roi"].round(1).map(lambda v: "n/a" if pd.isna(v) else f"{v}%"),
                 labels={"roi": "ROI (%)"},
                 title="ROI by Sales Channel",
             )
             fig2.update_traces(textposition="outside")
-            st.plotly_chart(fig2, use_container_width=True)
+            st.plotly_chart(fig2, width="stretch")
 
     st.caption(
         "Use this page for a high-level health check: are we acquiring profitable customers and where is ROI strongest?"
@@ -442,7 +455,12 @@ elif page == "Why People Churn":
         "**save-campaigns**, retention journeys, and service interventions."
     )
 
-    if "Sales Channel" not in df.columns:
+    if "Churn" not in df.columns:
+        st.warning(
+            "This page needs a `Churn` (Yes/No) column, which is not in the current "
+            "dataset. Upload a CSV that includes it."
+        )
+    elif "Sales Channel" not in df.columns:
         st.error("Sales Channel is required to analyze churn by segment.")
     else:
         segment_options = [
@@ -456,7 +474,7 @@ elif page == "Why People Churn":
         segment_col = st.selectbox("View churn by segment", segment_options, index=0)
 
         seg_df = kpis_by_segment(df, CHANNEL_COST_MAP, segment_col)
-        st.dataframe(seg_df, use_container_width=True)
+        st.dataframe(seg_df, width="stretch")
 
         if not seg_df.empty:
             fig = px.bar(
@@ -469,7 +487,7 @@ elif page == "Why People Churn":
             )
             fig.update_traces(textposition="outside")
             fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         """
@@ -506,7 +524,7 @@ elif page == "Why People Convert":
         segment_col = st.selectbox("View conversion by", segment_options, index=0)
 
         seg_df = kpis_by_segment(df, CHANNEL_COST_MAP, segment_col)
-        st.dataframe(seg_df, use_container_width=True)
+        st.dataframe(seg_df, width="stretch")
 
         if not seg_df.empty:
             fig = px.bar(
@@ -519,7 +537,7 @@ elif page == "Why People Convert":
             )
             fig.update_traces(textposition="outside")
             fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
     st.markdown(
         """
@@ -562,6 +580,7 @@ elif page == "Why People Engage":
         }
         if has_eng_score:
             agg_dict["avg_engagement"] = ("EngagementScore", "mean")
+        if "Customer Lifetime Value" in df.columns:
             agg_dict["avg_clv"] = ("Customer Lifetime Value", "mean")
 
         g = (
@@ -571,7 +590,7 @@ elif page == "Why People Engage":
             .sort_values("engaged_rate", ascending=False)
         )
 
-        st.dataframe(g, use_container_width=True)
+        st.dataframe(g, width="stretch")
 
         if not g.empty:
             fig = px.bar(
@@ -584,7 +603,7 @@ elif page == "Why People Engage":
             )
             fig.update_traces(textposition="outside")
             fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
 
             if has_eng_score:
                 fig2 = px.bar(
@@ -596,7 +615,7 @@ elif page == "Why People Engage":
                     title=f"Average EngagementScore by {seg_col}",
                 )
                 fig2.update_traces(textposition="outside")
-                st.plotly_chart(fig2, use_container_width=True)
+                st.plotly_chart(fig2, width="stretch")
 
         st.markdown(
             """
@@ -633,7 +652,7 @@ elif page == "Time Series Analysis":
             )
             .reset_index()
         )
-        st.dataframe(ts, use_container_width=True)
+        st.dataframe(ts, width="stretch")
 
         fig = px.line(
             ts,
@@ -644,7 +663,7 @@ elif page == "Time Series Analysis":
             title="Conversion rate over time",
         )
         fig.update_yaxes(tickformat=".0%")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 # -----------------------------------------------------------------------------
 # Page: Sentiment Analysis
@@ -713,7 +732,7 @@ elif page == "Product Recommendations":
             .head(30)
             .reset_index()
         )
-        st.dataframe(top_products, use_container_width=True)
+        st.dataframe(top_products, width="stretch")
 
         if top_products.empty:
             st.warning("No positive-quantity products found.")
@@ -742,7 +761,7 @@ elif page == "Product Recommendations":
                 )
 
                 st.markdown(f"### Frequently bought with **{base_product}**")
-                st.dataframe(co_counts, use_container_width=True)
+                st.dataframe(co_counts, width="stretch")
 
                 fig = px.bar(
                     co_counts,
@@ -753,7 +772,7 @@ elif page == "Product Recommendations":
                 )
                 fig.update_traces(textposition="outside")
                 fig.update_layout(xaxis_tickangle=-40)
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 st.markdown(
                     """
@@ -819,7 +838,7 @@ elif page == "Customer Segmentation":
         )
 
         st.markdown("### RFM customer table (sample)")
-        st.dataframe(rfm.head(20), use_container_width=True)
+        st.dataframe(rfm.head(20), width="stretch")
 
         # Scale and cluster
         features = rfm[["Recency", "Frequency", "Monetary"]].copy()
@@ -845,7 +864,7 @@ elif page == "Customer Segmentation":
         )
 
         st.markdown("### Segment profiles")
-        st.dataframe(seg_summary, use_container_width=True)
+        st.dataframe(seg_summary, width="stretch")
 
         # Scatter plot (R vs M, bubble = Frequency)
         fig = px.scatter(
@@ -857,7 +876,7 @@ elif page == "Customer Segmentation":
             hover_data=["CustomerID", "Country"],
             title="Customer segments (Recency vs Monetary, bubble = Frequency)",
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         st.markdown(
             """
